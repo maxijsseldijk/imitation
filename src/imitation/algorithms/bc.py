@@ -24,12 +24,13 @@ import numpy as np
 import torch as th
 import tqdm
 from stable_baselines3.common import policies, torch_layers, utils, vec_env
-
+from stable_baselines3.common import distributions
 from imitation.algorithms import base as algo_base
 from imitation.data import rollout, types
 from imitation.policies import base as policy_base
 from imitation.util import logger as imit_logger
 from imitation.util import util
+
 
 
 @dataclasses.dataclass(frozen=True)
@@ -127,10 +128,8 @@ class BehaviorCloningLossCalculator:
 
         # policy.evaluate_actions's type signatures are incorrect.
         # See https://github.com/DLR-RM/stable-baselines3/issues/1679
-        (_, log_prob, entropy) = policy.evaluate_actions(
-            tensor_obs,  # type: ignore[arg-type]
-            acts,
-        )
+        log_prob = self._get_log_policy_act_prob(tensor_obs, acts, policy)
+        entropy = None
         prob_true_act = th.exp(log_prob).mean()
         log_prob = log_prob.mean()
         entropy = entropy.mean() if entropy is not None else None
@@ -143,7 +142,9 @@ class BehaviorCloningLossCalculator:
         ent_loss = -self.ent_weight * (entropy if entropy is not None else th.zeros(1))
         neglogp = -log_prob
         l2_loss = self.l2_weight * l2_norm
-        loss = neglogp + ent_loss + l2_loss
+        device = neglogp.device
+
+        loss = neglogp + ent_loss.to(device) + l2_loss.to(device)
 
         return BCTrainingMetrics(
             neglogp=neglogp,
@@ -155,7 +156,43 @@ class BehaviorCloningLossCalculator:
             loss=loss,
         )
 
+    def _get_log_policy_act_prob(
+        self,
+        obs_th: th.Tensor,
+        acts_th: th.Tensor,
+        policy: policies.ActorCriticPolicy,
+    ) -> Optional[th.Tensor]:
+        """Evaluates the given actions on the given observations.
 
+        Args:
+            obs_th: A batch of observations.
+            acts_th: A batch of actions.
+
+        Returns:
+            A batch of log policy action probabilities.
+        """
+       
+        gen_algo_actor = policy.actor
+        assert gen_algo_actor is not None
+        # generate log_policy_act_prob from SAC actor.
+        mean_actions, log_std, _ = gen_algo_actor.get_action_dist_params(obs_th)
+        assert isinstance(
+            gen_algo_actor.action_dist,
+            distributions.SquashedDiagGaussianDistribution,
+        )  # Note: this is just a hint to mypy
+        distribution = gen_algo_actor.action_dist.proba_distribution(
+            mean_actions,
+            log_std,
+        )
+        # SAC applies a squashing function to bound the actions to a finite range
+        # `acts_th` need to be scaled accordingly before computing log prob.
+        # Scale actions only if the policy squashes outputs.
+        assert policy.squash_output
+        scaled_acts = policy.scale_action(acts_th.numpy(force=True))
+        scaled_acts_th = th.as_tensor(scaled_acts, device=mean_actions.device)
+        log_policy_act_prob_th = distribution.log_prob(scaled_acts_th)
+        return log_policy_act_prob_th
+        
 def enumerate_batches(
     batch_it: Iterable[types.TransitionMapping],
 ) -> Iterable[Tuple[Tuple[int, int, int], types.TransitionMapping]]:
